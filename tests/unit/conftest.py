@@ -249,6 +249,15 @@ def isolate_host_environment(isolated_aws_config_files: tuple[Path, Path]) -> It
 
 
 @pytest.fixture(autouse=True)
+def isolate_token_count_memo() -> Iterator[None]:
+    from litellm.litellm_core_utils.token_counter import _TOKEN_COUNT_MEMO
+
+    _TOKEN_COUNT_MEMO.clear()
+    yield
+    _TOKEN_COUNT_MEMO.clear()
+
+
+@pytest.fixture(autouse=True)
 def isolate_litellm_globals() -> Iterator[None]:
     original_callbacks: Final = {name: list(getattr(litellm, name) or []) for name in CALLBACK_LISTS}
     original_reset: Final = {name: getattr(litellm, name) for name in RESET_TO_NONE_GLOBALS}

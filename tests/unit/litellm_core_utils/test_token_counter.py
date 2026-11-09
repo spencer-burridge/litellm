@@ -27,6 +27,7 @@ import litellm
 from litellm import decode, encode, get_modified_max_tokens
 from litellm import token_counter as token_counter_old
 import litellm.constants
+import litellm.litellm_core_utils.token_counter as token_counter_module
 from litellm.constants import TOKEN_COUNTER_MAX_CONCURRENT_COUNTS
 from litellm.litellm_core_utils.asyncify import asyncify
 from litellm.litellm_core_utils.token_counter import (
@@ -1932,3 +1933,110 @@ def test_messages_reach_token_count_honours_disable_token_counter(monkeypatch: p
     messages = _threshold_test_messages(turns=3)
     assert messages_reach_token_count(model="gpt-4o", messages=messages, threshold=0) is True
     assert messages_reach_token_count(model="gpt-4o", messages=messages, threshold=1) is False
+
+
+class _CountingEncoder:
+    """A huggingface-shaped tokenizer that splits on spaces and records every long text it encodes."""
+
+    def __init__(self, tokens_per_word: int = 1) -> None:
+        self.tokens_per_word: Final = tokens_per_word
+        self.encoded: list[str] = []  # mutable-ok: recorder for the encoder double
+
+    def encode_batch_fast(self, texts: list[str]) -> list[list[int]]:
+        self.encoded.extend(text for text in texts if len(text) >= litellm.constants.TOKEN_COUNT_MEMO_MIN_CHARS)
+        return [[0] * (len(text.split()) * self.tokens_per_word) for text in texts]
+
+
+_LONG_TURN: Final = "the agent read the file and planned its next edit " * 40
+
+
+def _turn(turn: int) -> dict[str, object]:
+    return {"role": "user", "content": f"turn {turn}: {_LONG_TURN}"}
+
+
+def _counted_with(encoder: _CountingEncoder, messages: list[dict[str, object]]) -> int:
+    return token_counter_new(
+        custom_tokenizer={"type": "huggingface_tokenizer", "tokenizer": encoder}, messages=messages
+    )
+
+
+def test_recounting_the_same_long_prompt_reuses_the_first_count():
+    encoder: Final = _CountingEncoder()
+    messages: Final = [_turn(turn) for turn in range(3)]
+
+    counts: Final = tuple(_counted_with(encoder, messages) for _ in range(5))
+
+    assert len(set(counts)) == 1
+    assert encoder.encoded == [message["content"] for message in messages]
+
+
+def test_a_new_turn_only_tokenizes_the_text_it_added():
+    encoder: Final = _CountingEncoder()
+    earlier: Final = [_turn(turn) for turn in range(4)]
+    _counted_with(encoder, earlier)
+    encoder.encoded.clear()
+
+    grown: Final = [*earlier, _turn(4)]
+    grown_count: Final = _counted_with(encoder, grown)
+
+    assert encoder.encoded == [_turn(4)["content"]]
+    assert grown_count == _counted_with(_CountingEncoder(), grown)
+
+
+def test_an_edited_message_is_counted_again():
+    encoder: Final = _CountingEncoder()
+    original: Final = [_turn(0), _turn(1)]
+    before: Final = _counted_with(encoder, original)
+
+    after: Final = _counted_with(
+        encoder, [_turn(0), {"role": "user", "content": f"{_turn(1)['content']}plus three words"}]
+    )
+
+    assert after == before + 3
+
+
+def test_the_same_text_under_two_tokenizers_keeps_each_tokenizers_count():
+    messages: Final = [_turn(0)]
+
+    by_words: Final = _counted_with(_CountingEncoder(tokens_per_word=1), messages)
+    by_doubled: Final = _counted_with(_CountingEncoder(tokens_per_word=2), messages)
+
+    assert by_doubled - by_words == len(_turn(0)["content"].split()) + len("user".split())
+
+
+def test_short_texts_are_not_memoized():
+    calls: list[str] = []  # mutable-ok: recorder for the count double
+    count: Final = token_counter_module._memoized_count_function(object(), lambda text: len(calls.append(text) or text))
+
+    for _ in range(3):
+        count("hi there")
+
+    assert calls == ["hi there"] * 3
+
+
+def test_the_memo_never_holds_more_than_its_configured_entries():
+    calls: list[str] = []  # mutable-ok: recorder for the count double
+    count: Final = token_counter_module._memoized_count_function(
+        object(),
+        lambda text: len(calls.append(text) or text),
+        memo=token_counter_module._TokenCountMemo(max_entries=2),
+        min_chars=1,
+        max_entries=2,
+    )
+
+    for text in ("first text", "second text", "third text", "first text"):
+        count(text)
+
+    assert calls == ["first text", "second text", "third text", "first text"]
+
+
+def test_a_zero_entry_memo_counts_every_time():
+    calls: list[str] = []  # mutable-ok: recorder for the count double
+    count: Final = token_counter_module._memoized_count_function(
+        object(), lambda text: len(calls.append(text) or text), min_chars=1, max_entries=0
+    )
+
+    count(_LONG_TURN)
+    count(_LONG_TURN)
+
+    assert calls == [_LONG_TURN, _LONG_TURN]
