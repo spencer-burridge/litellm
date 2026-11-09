@@ -154,14 +154,14 @@ class AutoRouter(CustomLogger):
             self.routelayer = routelayer
 
         message_content: Final = self._extract_text_from_messages(messages)
-        route_name: Final = self._matched_route_name(routelayer, message_content)
+        route_name: Final = await self._matched_route_name(routelayer, message_content)
 
         return PreRoutingHookResponse(
             model=route_name or self.default_model,
             messages=messages,
         )
 
-    def _matched_route_name(self, routelayer: "SemanticRouter", text: str) -> str | None:
+    async def _matched_route_name(self, routelayer: "SemanticRouter", text: str) -> str | None:
         """Name of the route `text` matches, or None when nothing matched or the match failed.
 
         The route layer embeds `text` to compare it against the routes, and that embedding call can
@@ -171,7 +171,7 @@ class AutoRouter(CustomLogger):
         from semantic_router.schema import RouteChoice
 
         try:
-            route_choice: Final = routelayer(text=text)
+            route_choice: Final = await routelayer.acall(text=text)
         except Exception as e:  # noqa: BLE001 -- the embedding call behind the route layer can fail many ways (context limit, timeout, provider/network error); none of them may fail the request
             verbose_router_logger.warning(
                 "AutoRouter: semantic routing failed (%s), falling back to default model %s", e, self.default_model

@@ -2,7 +2,8 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Dict, Final, List, Optional
+import time
+from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -233,7 +234,7 @@ class TestAutoRouter:
         mock_semantic_router_class.from_json.return_value = mock_loaded_router
 
         mock_routelayer = MagicMock()
-        mock_routelayer.return_value = mock_route_choice
+        mock_routelayer.acall = AsyncMock(return_value=mock_route_choice)
         mock_semantic_router_class.return_value = mock_routelayer
 
         auto_router = AutoRouter(
@@ -255,7 +256,7 @@ class TestAutoRouter:
         assert result is not None
         assert result.model == "test-model"  # Should use the route choice name
         assert result.messages == messages
-        mock_routelayer.assert_called_once_with(text="test message")
+        mock_routelayer.acall.assert_awaited_once_with(text="test message")
 
     @pytest.mark.asyncio
     @patch("semantic_router.routers.SemanticRouter")
@@ -274,7 +275,7 @@ class TestAutoRouter:
         mock_semantic_router_class.from_json.return_value = mock_loaded_router
 
         mock_routelayer = MagicMock()
-        mock_routelayer.return_value = [mock_route_choice]  # Return list
+        mock_routelayer.acall = AsyncMock(return_value=[mock_route_choice])
         mock_semantic_router_class.return_value = mock_routelayer
 
         auto_router = AutoRouter(
@@ -338,7 +339,7 @@ ROUTER_CONFIG: Final = json.dumps(
 class FailingRouteLayer:
     """Route layer whose embedding call fails, as it does when the prompt exceeds the encoder's window."""
 
-    def __call__(self, text: str) -> Any:
+    async def acall(self, text: str) -> Any:
         raise ValueError(
             "Internal_litellm_router API call failed. Error: litellm.InternalServerError: "
             "input is too large to process. increase the physical batch size"
@@ -352,7 +353,7 @@ class FixedRouteLayer:
         self.route_choice = route_choice
         self.seen_text: str | None = None
 
-    def __call__(self, text: str) -> Any:
+    async def acall(self, text: str) -> Any:
         self.seen_text = text
         return self.route_choice
 
@@ -360,12 +361,24 @@ class FixedRouteLayer:
 class StubEmbeddingRouter:
     """Stands in for the LiteLLM Router when the route index has to be built for real."""
 
-    def embedding(self, input: List[str], model: str, **kwargs: Any) -> Any:
+    def __init__(self, latency_seconds: float = 0.0) -> None:
+        self.latency_seconds = latency_seconds
+
+    @staticmethod
+    def _response(input: list[str]) -> Any:
         import litellm
 
         return litellm.EmbeddingResponse(
             data=[{"embedding": [0.1, 0.2], "index": i, "object": "embedding"} for i in range(len(input))]
         )
+
+    def embedding(self, input: list[str], model: str, **kwargs: Any) -> Any:
+        time.sleep(self.latency_seconds)
+        return self._response(input)
+
+    async def aembedding(self, input: list[str], model: str, **kwargs: Any) -> Any:
+        await asyncio.sleep(self.latency_seconds)
+        return self._response(input)
 
 
 def _auto_router(routelayer: Any, litellm_router_instance: Any = None, **kwargs: Any) -> AutoRouter:
@@ -479,3 +492,25 @@ class TestAutoRouterEmbeddingInputCap:
 
         assert auto_router.routelayer is not None
         assert auto_router.routelayer.encoder.max_input_chars == 777
+
+
+class TestAutoRouterConcurrency:
+    @pytest.mark.asyncio
+    async def test_should_embed_concurrent_requests_without_blocking_the_event_loop(self):
+        latency: Final = 0.2
+        concurrent_requests: Final = 10
+        auto_router: Final = _auto_router(None, litellm_router_instance=StubEmbeddingRouter(latency_seconds=latency))
+        messages: Final = [{"role": "user", "content": "fix this stack trace"}]
+        await auto_router.async_pre_routing_hook(model="my-auto-router", request_kwargs={}, messages=messages)
+
+        started: Final = time.perf_counter()
+        results: Final = await asyncio.gather(
+            *(
+                auto_router.async_pre_routing_hook(model="my-auto-router", request_kwargs={}, messages=messages)
+                for _ in range(concurrent_requests)
+            )
+        )
+        elapsed: Final = time.perf_counter() - started
+
+        assert [r.model for r in results if r is not None] == ["code-model"] * concurrent_requests
+        assert elapsed < latency * concurrent_requests / 2
